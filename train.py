@@ -252,12 +252,30 @@ def ptb_train( epoch, args, train_data, model, named_params, logger, criterion, 
         if args.dataset in ['PTB-Char', 'PTB-Word']:
             optimizer.param_groups[0]['lr'] = lr2 * seq_len / ( args.bptt * 2 * PARTS)
         
+        switch = 0
         xhidden = repackage_hidden(hidden)
-        while (start < end) and (end < T):
+        prev_xhidden = [ xhidden ]
+        while (start < end) and (end <= T):
             cur_data, cur_targets = xdata[start:end, :], xtargets[start:end, :].contiguous().view(-1)
             #if cur_targets.size(0) == 0:
             #    print('Error.. 0 length input')
             #    exit(1)
+
+            '''if args.dataset == 'PTB-Word':
+              if len(prev_xhidden)>=2:
+                if (np.random.randint(0,2)==0) and (switch<=2):
+                    xhidden = []
+                    _prev_idx = np.random.randint(0, len(prev_xhidden))
+                    xhidden1 = prev_xhidden[ _prev_idx ]
+ 
+                    _prev_idx = np.random.randint(0, len(prev_xhidden))
+                    xhidden2 = prev_xhidden[ _prev_idx ]
+                    for _idxx, xh in enumerate(xhidden2):
+                       if len( xhidden1[0] ) == 2 :
+                           xhidden.append( (xhidden1[ _idxx ][0], xhidden2[ _idxx ][1]) )
+                       else:
+                           xhidden.append( xhidden1[ _idxx ][0] )
+                    switch += 1 '''
 
             old_xhidden = xhidden
             if args.debias:
@@ -285,22 +303,34 @@ def ptb_train( epoch, args, train_data, model, named_params, logger, criterion, 
 
                     loss = raw_loss
                     # Activiation Regularization
-                    if args.ptb_alpha: loss = loss + sum(args.ptb_alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
+                    if args.ptb_alpha: 
+                        alpha_loss = sum(args.ptb_alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
+                        loss = loss + alpha_loss #sum(args.ptb_alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
+                    
                     # Temporal Activation Regularization (slowness)
-                    if args.ptb_beta: loss = loss + sum(args.ptb_beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
-
+                    if (end-start > 2 ) and (args.ptb_beta):  
+                        beta_loss = sum(args.ptb_beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
+                        loss = loss + beta_loss #sum(args.ptb_beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
+                        #if math.isnan( beta_loss.item() ): 
+                        #    for rnn_h in rnn_hs:
+                        #        print( torch.isnan(rnn_h).any() )
+                        #    #print( rnn_hs )
+                        #    #exit(1)
                 else:
                     output, xhidden = model(cur_data, xhidden)
                     loss = criterion(output, cur_targets)
             
                 total_mini_loss += loss.item()
-                _lambda = 2.0
-                #if args.dataset == 'PTB-Char': _lambda = 10.0
+                _lambda = args.lmbda#2.0
+                ##if args.dataset == 'PTB-Char': _lambda = 10.0
+                #if args.dataset == 'PTB-Word': _lambda = 10.0
                 regularizer = get_regularizer_named_params( named_params, args, _lambda=_lambda )       
                 loss += regularizer
                 total_regularization_loss += regularizer.item()
-                #print('-- total_mini_loss = ', total_mini_loss, ' -- loss=', loss.item())
+                #print(end-start, start, end, T, PARTS, ' -- total_mini_loss = ', total_mini_loss, ' -- loss=', loss.item(), '-- regularizer = ', regularizer.item(), ' -- raw_loss=', raw_loss.item(), '--alpha=', alpha_loss.item(), ' --beta=', beta_loss.item())
             
+                #if math.isnan( beta_loss.item() ):  exit(1)
+
                 loss.backward()
                 if args.dataset in ['PTB-Char', 'PTB-Word'] or args.debias:
                     #torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
@@ -308,11 +338,13 @@ def ptb_train( epoch, args, train_data, model, named_params, logger, criterion, 
                 optimizer.step() 
             
             post_optimizer_updates( named_params, args, epoch ) 
+            prev_xhidden.append( xhidden )
 
             s_id += 1
             start = end
             end = start + STEP #start + args['small_batch_size']
-            if end >= T: end = T-1
+            #if end >= T: end = T-1
+            if end > T: end = T
 
         targets = targets.contiguous().view(-1)
         model.zero_grad()
@@ -518,6 +550,7 @@ parser = argparse.ArgumentParser(description='Sequential Decision Making..')
 parser.add_argument('--alpha', type=float, default=0.1, help='Alpha')
 parser.add_argument('--beta', type=float, default=0.5, help='Beta')
 parser.add_argument('--rho', type=float, default=0.0, help='Rho')
+parser.add_argument('--lmbda', type=float, default=2.0, help='Lambda')
 parser.add_argument('--debias', action='store_true', help='FedDyn debias algorithm')
 parser.add_argument('--K', type=int, default=1, help='Number of iterations for debias algorithm')
 
@@ -618,6 +651,7 @@ args.cuda = True
 
 exp_name = args.dataset + '-nhid-' + str(args.nhid) + '-parts-' + str(args.parts) + '-optim-' + args.optim
 exp_name += '-B-' + str(args.batch_size) + '-E-' + str(args.epochs) + '-K-' + str(args.K)
+exp_name += '-alpha-' + str(args.alpha) + '-beta-' + str(args.beta)
 if args.permute:
     exp_name += '-perm-' + str(args.permute)
 if args.per_ex_stats:
